@@ -138,8 +138,7 @@ local $SIG{ALRM} = sub {
 
 
 ### Pull up the process list
-my $process_list = `cat output_from_ps_auxwww.txt`;
-# my $process_list = `ps auxwww`;
+my $process_list = `ps auxwwwc`;
 
 
 ### Parse process list into something we can easily grep
