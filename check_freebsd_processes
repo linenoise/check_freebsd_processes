@@ -1,0 +1,399 @@
+#!/usr/bin/perl -w
+
+=head1 NAME
+
+check_freebsd_processess - Nagios plugin to monitor FreeBSD processes
+
+=cut
+
+# The POD text continues at the end of the file.
+
+use strict;
+use Data::Dumper;   ### For generating debug output in verbose mode
+use Nagios::Plugin; ### For communicating with the nagios server
+
+
+### Show us whatcha workin' with (with reference to `man ps`)
+my %prefix_states = (
+	'D' => 'disk-wait',	### Marks a process in disk (or other short term, uninterruptible) wait.
+	'I' => 'idle',		### Marks a process that is idle (sleeping for longer than about 20 seconds).
+	'L' => 'lock-wait',	### Marks a process that is waiting to acquire a lock.
+	'R' => 'runnable',	### Marks a runnable process.
+	'S' => 'sleeping',	### Marks a process that is sleeping for less than about 20 seconds.
+	'T' => 'stopped',	### Marks a stopped process.
+	'W' => 'idle-int',	### Marks an idle interrupt thread.
+	'Z' => 'zombie',	### Marks a dead process (a zombie).    
+);
+
+my %suffix_states = (
+	'+' => 'foreground',		### The process is in the foreground process group of its control terminal.
+	'<' => 'high-priority',		### The process has raised CPU scheduling priority.
+	'E' => 'exit-wait',			### The process is trying to exit.
+	'J' => 'jailed',			### Marks a process which is in jail(2).
+	'L' => 'locked',			### The process has pages locked in core (for example, for raw I/O).
+	'N' => 'low-priority',		### The process has reduced CPU scheduling priority (see setpriority(2)).
+	's' => 'session-leader',	### The process is a session leader.
+	'V' => 'vfork-suspended',	### The process is suspended during a vfork(2).
+	'W' => 'swapped-out',		### The process is swapped out.
+	'X' => 'in-trace',			### The process is being traced or debugged.
+);
+
+
+### Coalesce states into a central lookup
+my %states = ();
+foreach my $key (keys %prefix_states){
+	$states{$prefix_states{$key}} = {
+		affixation => 'prefix',
+		symbol => $key
+	}
+}
+foreach my $key (keys %suffix_states){
+	$states{$suffix_states{$key}} = {
+		affixation => 'suffix',
+		symbol => $key
+	}
+}
+
+### N.B. - at this point, %states looks like this:
+# (
+#	'disk-wait' => {
+#		'symbol' => 'D',
+#		'affixation' => 'prefix'
+#	},
+#	'idle' => {
+#		'symbol' => 'I',
+#		'affixation' => 'prefix'
+#	},
+#	'vfork-suspended' => {
+#		'symbol' => 'V',
+#		'affixation' => 'suffix'
+#	},
+#	'in-trace' => {
+#		'symbol' => 'X',
+#		'affixation' => 'suffix'
+#	},
+#   ...
+# );
+###
+
+my $available_states = join(', ', sort(keys(%states)));
+
+### Initialize the plugin
+my $plugin = Nagios::Plugin->new( 
+	shortname => "FREEBSD",
+    usage => "Usage: check_freebsd_processes [-s <state_name>] [-p <process_name>] [-u <user_name>] "
+    	    ."(-w <warning_threshold> -c <critical_threshold>)",
+	version => '0.1.0',
+	url     => 'http://fragmentedzen.com/software/check_freebsd_processes',
+	license => 'This nagios plugin is free software, and comes with '
+			  ."ABSOLUTELY NO WARRANTY.\nIt may be used, redistributed "
+			  ."and/or modified under the terms of the \nGNU General "
+			  .'Public Licence. See LICENSE.txt for more information.',
+	plugin  => 'check_freebsd_processes',
+	extra	=> "\nAvailable states: $available_states.\n"
+);
+
+
+### Add arguments for secure mode, username, and password
+$plugin->add_arg(
+	spec => 'warning|w=s',
+	help => "-w, --warning=INTEGER\n   Threshold at which this measurement "
+		   .'should generate a WARNING condiiton'
+);
+$plugin->add_arg(
+	spec => 'critical|c=s',
+	help => "-c, --critical=INTEGER\n   Threshold at which this measurement "
+		   .'should generate a CRITICAL condiiton'
+);
+$plugin->add_arg(
+	spec => 'process_name|p=s',
+	help => "-p --process_name=STRING",
+);
+$plugin->add_arg(
+	spec => 'state_name|s=s',
+	help => "-s --state_name=STRING",
+);
+
+
+### Parse command line options
+$plugin->getopts;
+$plugin->set_thresholds(
+	warning => $plugin->opts->warning,
+	critical => $plugin->opts->critical,
+);
+print 'Dump of $plugin: ' . Dumper($plugin) if $plugin->opts()->verbose >= 3;
+
+
+### If they gave us a state, make sure it's a valid one
+if ($plugin->opts->state_name && !$states{$plugin->opts->state_name}) {
+	$plugin->nagios_exit( UNKNOWN, $plugin->opts->state_name.' is not a valid state name' );
+}
+
+
+### Set timeout clock
+alarm($plugin->opts()->timeout);
+local $SIG{ALRM} = sub { 
+	$plugin->nagios_exit( UNKNOWN, "Host timed out" );
+};
+
+
+### Pull up the process list
+my $process_list = `cat output_from_ps_auxwww.txt`;
+# my $process_list = `ps auxwww`;
+
+
+### Parse process list into something we can easily grep
+my @processes = split( /\n/, $process_list);
+shift @processes; ### Get rid of the first line (the column titles)
+my @process_hashes = ();
+foreach my $process (@processes){
+	my ($prefix, $suffixes) = ('','');	
+	$process =~ s/^(\w*)\s*(\d*)\s*([\d\.]*)\s*([\d\.]*)\s*(\d*)\s*(\d*)\s*([\w\d\?]*)\s*([\w\+\<]*)\s*([\w\d\:]*)\s*([\d\:\.]*)\s*(.*)$/ 
+		$prefix = $suffixes = reverse $8;
+		$prefix = chop $suffixes;
+		$suffixes = reverse $suffixes;
+		push @process_hashes, {
+			user			=> $1,
+			pid				=> $2,
+			cpu_usage		=> $3,
+			mem_usage		=> $4,
+			virtual_memory	=> $5,
+			real_memory		=> $6,
+			terminal		=> $7,
+			state			=> {
+				prefix 			=> $prefix,
+				suffixes 		=> $suffixes
+			},
+			started			=> $9,
+			time_running	=> $10,
+			command			=> $11,
+		};
+	/gsex;
+}
+
+### N.B. - at this point, \@process_hashes looks like this:
+# [
+#	{
+#	  'time_running' => '0:00.01',
+#	  'state' => {
+#	               'suffixes' => 's+',
+#	               'prefix' => 'I'
+#	             },
+#	  'mem_usage' => '0.1',
+#	  'real_memory' => '2412',
+#	  'pid' => '20830',
+#	  'terminal' => 'p0',
+#	  'user' => 'root',
+#	  'cpu_usage' => '0.0',
+#	  'started' => '6:10PM',
+#	  'command' => 'csh',
+#	  'virtual_memory' => '9616'
+#	},
+#	{
+#	  'time_running' => '0:00.00',
+#	  'state' => {
+#	               'suffixes' => '+',
+#	               'prefix' => 'R'
+#	             },
+#	  'mem_usage' => '0.0',
+#	  'real_memory' => '1100',
+#	  'pid' => '21313',
+#	  ...
+#	},
+#   ...
+# ]
+###
+
+### Filter process list based on our given state, command, and user values
+my $status_message = " processes";
+if ($plugin->opts->process_name) {
+	$status_message = ' ' . $plugin->opts->process_name . $status_message;
+	@process_hashes = grep({ $_->{command} eq $plugin->opts->process_name} @process_hashes);
+}
+if ($plugin->opts->state_name) {
+	my $filter_state = $plugin->opts->state_name;
+	$status_message = $status_message . ' in state ' . $plugin->opts->state_name;
+	if ($states{$plugin->opts->state_name}->{affixation} eq 'suffix') {
+		### If it's a suffix, match for it.
+		@process_hashes = grep(
+			{ grep( 
+				/$states{$plugin->opts->state_name}->{symbol}/,
+				$_->{state}->{suffixes})
+			} 
+			@process_hashes);
+	} else {
+		### If it's a prefix, equality-test for it.
+		@process_hashes = grep(
+			{ $_->{state}->{prefix} eq $states{$plugin->opts->state_name}->{symbol}} 
+			@process_hashes);
+	}
+}
+
+
+### Prepare Performance Data and Check Thresholds
+my $value = scalar(@process_hashes);
+$status_message = "$value$status_message";
+$plugin->add_perfdata(
+	label => 'processes',
+	value => $value,
+	uom => 'processes',
+	threshold => $plugin->threshold
+);
+my $status_code = $plugin->check_threshold($value);
+$plugin->nagios_exit( $status_code, $status_message ) 
+	if $status_code != OK;
+
+
+
+### Return the status message
+if ($plugin->opts->warning && $plugin->opts->critical) {
+	$plugin->nagios_exit( OK, $status_message );
+} else {
+	$plugin->nagios_exit( UNKNOWN, $status_message );
+}
+
+
+=head1 DESCRIPTION
+
+This script acts as a plugin module for the Nagios IT infrastructure monitoring 
+system. This script is designed to be run through NRPE on remote machines rather
+than being spawned by the central Nagios monitoring process.  This pulls a process
+list through ps(1), and optionally matches the subset of those processes based on 
+command name or execution state (wait, idle, swapped, etc).
+
+This has been tested with FreeBSD 7.2, but should work with any version of FreeBSD
+with compatible ps(1) output formatting. 
+
+=head2 Available States
+
+=over 4
+
+=item * disk-wait
+
+Marks a process in disk (or other short term, uninterruptible) wait.
+
+=item * exit-wait
+
+The process is trying to exit.
+
+=item * foreground
+
+The process is in the foreground process group of its control terminal.
+
+=item * high-priority
+
+The process has raised CPU scheduling priority.
+
+=item * idle
+
+Marks a process that is idle (sleeping for longer than about 20 seconds).
+
+=item * idle-int
+
+Marks an idle interrupt thread.
+
+=item * in-trace
+
+The process is being traced or debugged.
+
+=item * jailed
+
+Marks a process which is in jail(2).
+
+=item * lock-wait
+
+Marks a process that is waiting to acquire a lock.
+
+=item * locked
+
+The process has pages locked in core (for example, for raw I/O).
+
+=item * low-priority
+
+The process has reduced CPU scheduling priority (see setpriority(2)).
+
+=item * runnable
+
+The process is runnable.
+
+=item * session-leader
+
+The process is a session leader.
+
+=item * sleeping
+
+Marks a process that is sleeping for less than about 20 seconds.
+
+=item * stopped
+
+The process is stopped.
+
+=item * swapped-out
+
+The process is swapped out (aka "trashing" in the greater environment of high disk I/O).
+
+=item * vfork-suspended
+
+The process is suspended during a vfork(2).
+
+=item * zombie
+
+Marks a dead process (a 'zombie').
+
+=back
+
+=head1 SYNOPSIS
+
+=head2 Command Line Interface
+
+Once you're in the libexec directory for your NRPE plugins (or libexec for 
+nagios, in the case of monitoring the monitoring server), you can test the
+installation of this agent manually through the CLI.  To poll a server to 
+find out how many httpd (apache) processes are thrashing:
+
+	./check_freebsd_processes -w 1 -c 5 -p httpd -s swapped-out
+
+Poll a server to find out how many total processes are thrashing:
+
+	./check_freebsd_processes -w 15 -c 30
+
+=head1 SEE ALSO
+
+If using an external configuration file, it should be structured according to 
+the specification at <http://nagiosplugins.org/extra-opts/>.
+
+Thresholds given to this script should be in the format specified at 
+<http://nagiosplug.sourceforge.net/developer-guidelines.html#THRESHOLDFORMAT>.
+
+This module is built upon L<Nagios::Plugin> by the Nagios Plugin Development
+Team.  Further reading on Nagios, NPRE, and Nagios Plugins is available at
+<http://nagios.com/>.
+
+=head1 AUTHOR
+
+This script is written and maintained by Dann Stayskal <dann@stayskal.com>
+and is available on his website, at
+<http://fragmentedzen.com/software/check_apache/>.
+
+=head1 LICENSE
+
+Copyright (C) 2009 by Dann Stayskal.
+
+This program is free software; you can redistribute it and/or modify it under 
+the terms of the GNU General Public License as published by the Free Software 
+Foundation; either version 2 of the License, or (at your option) any later 
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY 
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A 
+PARTICULAR PURPOSE. See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with 
+this program; if not, write to the Free Software Foundation, Inc., 59 Temple 
+Place, Suite 330, Boston, MA 02111-1307 USA
+
+Nagios, the Nagios logo, and Nagios graphics are the servicemarks, trademarks, 
+or registered trademarks owned by Nagios Enterprises. All other servicemarks 
+and trademarks are the property of their respective owner.
+
+=cut
