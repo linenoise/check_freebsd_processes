@@ -84,7 +84,7 @@ my $plugin = Nagios::Plugin->new(
     usage => "Usage: check_freebsd_processes [-s <state_name>] [-p <process_name>] [-u <user_name>] "
     	    ."(-w <warning_threshold> -c <critical_threshold>)",
 	version => '0.1.0',
-	url     => 'http://fragmentedzen.com/software/check_freebsd_processes',
+	url     => 'http://dann.stayskal.com/software/check_freebsd_processes',
 	license => 'This nagios plugin is free software, and comes with '
 			  ."ABSOLUTELY NO WARRANTY.\nIt may be used, redistributed "
 			  ."and/or modified under the terms of the \nGNU General "
@@ -372,7 +372,7 @@ Team.  Further reading on Nagios, NPRE, and Nagios Plugins is available at
 
 This script is written and maintained by Dann Stayskal <dann@stayskal.com>
 and is available on his website, at
-<http://fragmentedzen.com/software/check_apache/>.
+<http://dann.stayskal.com/software/check_apache/>.
 
 =head1 LICENSE
 
